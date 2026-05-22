@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /Users/rvenkat/Projects/SchoolOfAI -name \"agent6.py\" -o -name \"*agent*\" -o -name \"*assignment*\" 2>/dev/null | head -20)",
+      "Read(//Users/rvenkat/Projects/SchoolOfAI/**)"
+    ]
+  }
+}
