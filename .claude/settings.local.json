@@ -2,7 +2,14 @@
   "permissions": {
     "allow": [
       "Bash(find /Users/rvenkat/Projects/SchoolOfAI -name \"agent6.py\" -o -name \"*agent*\" -o -name \"*assignment*\" 2>/dev/null | head -20)",
-      "Read(//Users/rvenkat/Projects/SchoolOfAI/**)"
+      "Read(//Users/rvenkat/Projects/SchoolOfAI/**)",
+      "Bash(uv sync *)",
+      "Bash(uv run python -c ' *)",
+      "Bash(uv run *)",
+      "Bash(curl -s http://localhost:8101/v1/status)",
+      "Bash(python3 -m json.tool)",
+      "Bash(curl -s \"http://localhost:8101/v1/calls?limit=5\")",
+      "Bash(curl -s \"http://localhost:8101/v1/calls?limit=20&status=error\")"
     ]
   }
 }

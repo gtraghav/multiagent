@@ -792,6 +792,173 @@ def _parse_prompted_tool_call(text: str):
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# Anthropic (Claude)
+# ────────────────────────────────────────────────────────────────────────────
+
+class AnthropicProvider(BaseProvider):
+    name = "claude"
+    capabilities = {
+        "tools": True, "caching": False, "reasoning": True,
+        "structured": True, "parallel_tools": True,
+    }
+
+    def __init__(self, api_key, model):
+        super().__init__(api_key, model, "https://api.anthropic.com/v1")
+
+    def _headers(self):
+        return {
+            "x-api-key": self.api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+
+    def _translate_tools(self, tools):
+        out = []
+        for t in tools or []:
+            d = t if isinstance(t, dict) else t.model_dump()
+            out.append({
+                "name": d["name"],
+                "description": d.get("description", ""),
+                "input_schema": d.get("input_schema") or {"type": "object", "properties": {}},
+            })
+        return out
+
+    def _translate_messages(self, messages):
+        out = []
+        for m in messages:
+            r = m.get("role")
+            if r == "system":
+                continue
+            if r == "tool":
+                out.append({
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": m.get("tool_call_id", ""),
+                        "content": m.get("content", "") if isinstance(m.get("content"), str) else json.dumps(m.get("content", "")),
+                    }],
+                })
+                continue
+            if r == "assistant":
+                content = []
+                if m.get("content"):
+                    content.append({"type": "text", "text": m["content"]})
+                for tc in (m.get("tool_calls") or []):
+                    fn = tc.get("function") or {}
+                    tc_name = fn.get("name") or tc.get("name", "")
+                    args_raw = fn.get("arguments") or tc.get("arguments") or {}
+                    if isinstance(args_raw, str):
+                        try:
+                            args = json.loads(args_raw)
+                        except Exception:
+                            args = {}
+                    else:
+                        args = args_raw
+                    content.append({
+                        "type": "tool_use",
+                        "id": tc.get("id") or f"toolu_{uuid.uuid4().hex[:8]}",
+                        "name": tc_name,
+                        "input": args,
+                    })
+                if not content:
+                    content = [{"type": "text", "text": ""}]
+                out.append({"role": "assistant", "content": content})
+                continue
+            content = m.get("content", "")
+            out.append({
+                "role": r,
+                "content": content if isinstance(content, str) else json.dumps(content),
+            })
+        return out
+
+    async def chat(self, messages, *, max_tokens=2048, temperature=0.7, model=None,
+                   tools=None, tool_choice=None, reasoning=None, response_format=None,
+                   system_blocks=None, cache_system=False):
+        m = model or self.model
+        system_text, _, _ = _flatten_system(system_blocks)
+
+        sys_parts = []
+        if system_text:
+            sys_parts.append(system_text)
+        if response_format:
+            rf = response_format if isinstance(response_format, dict) else response_format.model_dump(by_alias=True)
+            if rf.get("schema"):
+                sys_parts.append(
+                    f"\nRespond with ONLY a valid JSON object matching this schema (no prose, no markdown):\n"
+                    f"{json.dumps(rf['schema'], indent=2)}"
+                )
+            elif rf.get("type") == "json_object":
+                sys_parts.append("\nRespond with ONLY a valid JSON object.")
+
+        body: dict = {
+            "model": m,
+            "max_tokens": max_tokens,
+            "messages": self._translate_messages(messages),
+        }
+        if sys_parts:
+            body["system"] = "\n".join(sys_parts)
+
+        reasoning_applied = False
+        if reasoning and reasoning != "off":
+            budget_map = {"low": 2048, "medium": 8192, "high": 16000}
+            body["thinking"] = {"type": "enabled", "budget_tokens": budget_map.get(reasoning, 8192)}
+            body["temperature"] = 1.0  # extended thinking requires temp=1
+            reasoning_applied = True
+        else:
+            body["temperature"] = temperature
+
+        if tools:
+            body["tools"] = self._translate_tools(tools)
+            if tool_choice == "none":
+                body["tool_choice"] = {"type": "none"}
+            elif isinstance(tool_choice, dict) and "name" in tool_choice:
+                body["tool_choice"] = {"type": "tool", "name": tool_choice["name"]}
+            else:
+                body["tool_choice"] = {"type": "auto"}
+
+        async with httpx.AsyncClient(timeout=180) as c:
+            r = await c.post(f"{self.base_url}/messages", headers=self._headers(), json=body)
+            if r.status_code != 200:
+                raise ProviderError(
+                    f"claude HTTP {r.status_code}: {r.text[:400]}",
+                    status=r.status_code,
+                    retryable=(r.status_code not in (400, 401)),
+                )
+            d = r.json()
+            content_blocks = d.get("content") or []
+            text = ""
+            tool_calls_out = []
+            for block in content_blocks:
+                btype = block.get("type")
+                if btype == "text":
+                    text += block.get("text", "")
+                elif btype == "tool_use":
+                    tool_calls_out.append({
+                        "id": block.get("id") or f"toolu_{uuid.uuid4().hex[:8]}",
+                        "name": block.get("name", ""),
+                        "arguments": block.get("input") or {},
+                    })
+                # "thinking" blocks intentionally skipped
+            usage = d.get("usage") or {}
+            stop_raw = d.get("stop_reason", "end_turn")
+            stop_norm = "tool_use" if tool_calls_out else (
+                "max_tokens" if stop_raw == "max_tokens" else "end_turn"
+            )
+            return {
+                "text": text,
+                "tool_calls": tool_calls_out,
+                "input_tokens": usage.get("input_tokens", 0) or 0,
+                "output_tokens": usage.get("output_tokens", 0) or 0,
+                "cache_creation_input_tokens": usage.get("cache_creation_input_tokens", 0) or 0,
+                "cache_read_input_tokens": usage.get("cache_read_input_tokens", 0) or 0,
+                "stop_reason": stop_norm,
+                "model": m,
+                "tool_call_dialect": "native",
+                "reasoning_applied": reasoning_applied,
+            }
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # Per-model capability resolution
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -806,6 +973,8 @@ def model_capabilities(provider_name: str, model: str, default_caps: dict) -> di
         caps["reasoning"] = False
     if provider_name in ("groq", "cerebras", "nvidia", "openrouter", "github"):
         caps["reasoning"] = _model_supports_reasoning(model)
+    if provider_name == "claude":
+        caps["reasoning"] = True  # all Claude models support extended thinking
     return caps
 
 
@@ -831,6 +1000,8 @@ def build_providers(cache_store):
         out["github"] = GitHubProvider(k, os.getenv("GITHUB_MODEL", "openai/gpt-4.1-mini"))
     if om := os.getenv("OLLAMA_MODEL"):
         out["ollama"] = OllamaProvider(om, os.getenv("OLLAMA_URL", "http://localhost:11434"))
+    if k := os.getenv("ANTHROPIC_API_KEY"):
+        out["claude"] = AnthropicProvider(k, os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"))
     return out
 
 

@@ -32,6 +32,7 @@ class LLM:
         }
         body = {k: v for k, v in body.items() if v is not None}
         r = httpx.post(f"{self.base_url}/v1/chat", json=body, timeout=self.timeout)
+        print(f"[LLM] response status: {r.status_code}")
         r.raise_for_status()
         return r.json()
 
